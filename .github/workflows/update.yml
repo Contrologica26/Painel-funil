@@ -1,0 +1,186 @@
+name: Atualiza painel do funil
+
+on:
+  schedule:
+    - cron: '0 * * * *'      # de hora em hora (horario UTC)
+  workflow_dispatch:          # permite rodar na mao pelo botao "Run workflow"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixa o repositorio
+        uses: actions/checkout@v4
+
+      - name: Prepara Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Gera o painel (puxa Pipedrive)
+        env:
+          PIPEDRIVE_TOKEN: ${{ secrets.PIPEDRIVE_TOKEN }}
+          PIPEDRIVE_DOMAIN: 'contrologica'
+          PIPELINE_ID: '27'
+        run: |
+          python - <<'PY'
+          import os, json, urllib.request, urllib.parse, datetime
+          from collections import defaultdict
+
+          TOKEN = os.environ["PIPEDRIVE_TOKEN"]
+          PIPELINE_ID = int(os.environ.get("PIPELINE_ID", "27"))
+          DOMAIN = os.environ.get("PIPEDRIVE_DOMAIN", "").strip()
+
+          # Tenta o dominio da empresa primeiro; se falhar, usa o endereco generico.
+          BASES = []
+          if DOMAIN:
+              BASES.append(f"https://{DOMAIN}.pipedrive.com/api/v1")
+          BASES.append("https://api.pipedrive.com/v1")
+
+          _base = {"url": None}
+          def api(path, **params):
+              params["api_token"] = TOKEN
+              q = urllib.parse.urlencode(params)
+              tries = [_base["url"]] if _base["url"] else BASES
+              last = None
+              for b in tries:
+                  try:
+                      with urllib.request.urlopen(f"{b}/{path}?{q}", timeout=60) as r:
+                          data = json.load(r)
+                      if data.get("success", True):
+                          _base["url"] = b
+                          return data
+                  except Exception as e:
+                      last = e
+              raise RuntimeError(f"Falha na API Pipedrive ({path}): {last}")
+
+          # 1) Nomes reais das etapas do pipeline
+          stages = {}
+          try:
+              sd = api("stages", pipeline_id=PIPELINE_ID).get("data") or []
+              for s in sd:
+                  stages[s["id"]] = {"name": s["name"], "order": s.get("order_nr", 0)}
+          except Exception as e:
+              print("Aviso: nao consegui ler stages:", e)
+
+          # 2) Todos os negocios em aberto (com paginacao)
+          deals = []
+          start = 0
+          while True:
+              resp = api("deals", status="open", start=start, limit=100)
+              data = resp.get("data") or []
+              for d in data:
+                  if d.get("pipeline_id") == PIPELINE_ID:
+                      deals.append(d)
+              pag = (resp.get("additional_data") or {}).get("pagination") or {}
+              if pag.get("more_items_in_collection"):
+                  start = pag.get("next_start", start + 100)
+              else:
+                  break
+
+          # 3) Agrega por etapa
+          agg = defaultdict(lambda: {"count": 0, "value": 0.0})
+          for d in deals:
+              sid = d.get("stage_id")
+              agg[sid]["count"] += 1
+              agg[sid]["value"] += float(d.get("value") or 0)
+
+          def stage_key(sid):
+              return stages.get(sid, {}).get("order", 999), sid
+          ordered = sorted(agg.keys(), key=stage_key)
+
+          total_value = sum(a["value"] for a in agg.values())
+          total_count = sum(a["count"] for a in agg.values())
+          avg_ticket = total_value / total_count if total_count else 0
+          biggest = max(deals, key=lambda d: float(d.get("value") or 0)) if deals else None
+
+          def brl(v):
+              s = f"{v:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+              return "R$ " + s
+
+          maxv = max((agg[s]["value"] for s in ordered), default=1) or 1
+          rows_html = ""
+          for sid in ordered:
+              a = agg[sid]
+              name = stages.get(sid, {}).get("name", f"Etapa {sid}")
+              pct = a["value"] / maxv * 100
+              rows_html += f'''    <div class="bar-row">
+              <div class="name">{name}</div>
+              <div class="track"><div class="fill" style="width:{max(pct,7):.1f}%">{brl(a["value"])}</div></div>
+              <div class="cnt"><b>{a["count"]}</b><small>negocios</small></div>
+            </div>
+          '''
+
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
+          stamp = now.strftime("%d/%m/%Y %H:%M")
+          big_val = brl(float(biggest.get("value") or 0)) if biggest else "-"
+          big_name = (biggest.get("title") or "")[:34] if biggest else ""
+
+          html = f'''<!DOCTYPE html>
+          <html lang="pt-BR">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <meta http-equiv="refresh" content="1800">
+          <title>Funil Comercial - Contrologica</title>
+          <style>
+            :root{{--bg:#0b1220;--panel:#111c30;--panel2:#16233c;--line:#22314f;--txt:#eaf1ff;--muted:#93a4c4;--accent:#3b82f6;--accent2:#22d3ee;--green:#34d399;--amber:#fbbf24;}}
+            *{{box-sizing:border-box;margin:0;padding:0}}
+            body{{background:linear-gradient(160deg,#0b1220,#0e1830);color:var(--txt);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:2.2vw 2.6vw;min-height:100vh}}
+            header{{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding-bottom:1.1rem;margin-bottom:1.6rem}}
+            h1{{font-size:2.1rem;font-weight:700}} h1 span{{color:var(--accent2)}}
+            .sub{{color:var(--muted);font-size:.95rem;margin-top:.35rem}}
+            .stamp{{text-align:right;color:var(--muted);font-size:.9rem;line-height:1.5}} .stamp b{{color:var(--txt);font-size:1.05rem}}
+            .kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.1rem;margin-bottom:1.8rem}}
+            .kpi{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.3rem 1.4rem;position:relative;overflow:hidden}}
+            .kpi::after{{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--accent)}}
+            .kpi.k2::after{{background:var(--accent2)}} .kpi.k3::after{{background:var(--green)}} .kpi.k4::after{{background:var(--amber)}}
+            .kpi .lab{{color:var(--muted);font-size:.85rem;text-transform:uppercase;letter-spacing:.6px}}
+            .kpi .val{{font-size:2.05rem;font-weight:700;margin-top:.4rem}} .kpi .val small{{font-size:1rem;color:var(--muted);font-weight:500}}
+            .card{{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:1.6rem 1.8rem}}
+            .card h2{{font-size:1.2rem;margin-bottom:1.4rem;font-weight:600}}
+            .bar-row{{display:grid;grid-template-columns:190px 1fr 130px;align-items:center;gap:1rem;margin-bottom:1.15rem}}
+            .bar-row .name{{font-weight:600;font-size:1rem}}
+            .track{{background:var(--panel2);border-radius:10px;height:34px;position:relative;overflow:hidden}}
+            .fill{{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:flex-end;padding-right:.7rem;color:#001;font-weight:700;font-size:.9rem;min-width:60px}}
+            .cnt{{text-align:right}} .cnt b{{font-size:1.5rem}} .cnt small{{color:var(--muted);display:block;font-size:.78rem}}
+            footer{{margin-top:1.6rem;color:var(--muted);font-size:.82rem;text-align:center}}
+          </style>
+          </head>
+          <body>
+            <header>
+              <div>
+                <h1>Funil Comercial <span>Contrologica</span></h1>
+                <div class="sub">Negocios em aberto - atualizacao automatica de hora em hora</div>
+              </div>
+              <div class="stamp">Atualizado em<br><b>{stamp}</b></div>
+            </header>
+            <section class="kpis">
+              <div class="kpi k1"><div class="lab">Valor total em aberto</div><div class="val">{brl(total_value)}</div></div>
+              <div class="kpi k2"><div class="lab">Negocios abertos</div><div class="val">{total_count}</div></div>
+              <div class="kpi k3"><div class="lab">Ticket medio</div><div class="val">{brl(avg_ticket)}</div></div>
+              <div class="kpi k4"><div class="lab">Maior negocio</div><div class="val">{big_val} <small>{big_name}</small></div></div>
+            </section>
+            <div class="card">
+              <h2>Valor por etapa do funil</h2>
+          {rows_html}
+            </div>
+            <footer>Dados do Pipedrive - painel gerado automaticamente pelo GitHub Actions.</footer>
+          </body>
+          </html>'''
+
+          with open("index.html", "w", encoding="utf-8") as f:
+              f.write(html)
+          print(f"OK: {total_count} negocios, {len(ordered)} etapas, total {brl(total_value)}")
+          PY
+
+      - name: Publica se houver mudanca
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git diff --quiet --cached || git commit -m "Atualiza painel do funil"
+          git push
