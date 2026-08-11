@@ -25,9 +25,11 @@ jobs:
           PIPEDRIVE_TOKEN: ${{ secrets.PIPEDRIVE_TOKEN }}
           PIPEDRIVE_DOMAIN: 'contrologica'
           PIPELINE_ID: '27'
+          META_NEGOCIOS: '3000000'
+          META_SERVICOS: '500000'
         run: |
           python - <<'PY'
-          import os, json, urllib.request, urllib.parse, datetime
+          import os, json, re, urllib.request, urllib.parse, datetime
           from collections import defaultdict
 
           TOKEN = os.environ["PIPEDRIVE_TOKEN"]
@@ -97,6 +99,94 @@ jobs:
           avg_ticket = total_value / total_count if total_count else 0
           biggest = max(deals, key=lambda d: float(d.get("value") or 0)) if deals else None
 
+          # Indicadores de atencao
+          hoje = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).date()
+          def _pdate(s):
+              try:
+                  return datetime.date.fromisoformat(str(s)[:10])
+              except Exception:
+                  return None
+          sem_valor = sum(1 for d in deals if float(d.get("value") or 0) == 0)
+          followup_vencido = 0
+          sem_atividade = 0
+          for d in deals:
+              nad = d.get("next_activity_date")
+              if not nad:
+                  sem_atividade += 1
+              else:
+                  pd = _pdate(nad)
+                  if pd and pd < hoje:
+                      followup_vencido += 1
+
+          # Ganhos no pipeline: contagem (p/ conversao) + soma do ano por categoria (p/ metas)
+          META_NEG = float(os.environ.get("META_NEGOCIOS", "3000000"))
+          META_SERV = float(os.environ.get("META_SERVICOS", "500000"))
+          ano = hoje.year
+
+          def eh_servico(title):
+              t = (title or "").lower()
+              return ("serv" in t) or ("contrato" in t) or ("calibra" in t) or ("manuten" in t)
+
+          ganhos = 0
+          vendido_neg = 0.0
+          vendido_serv = 0.0
+          start = 0
+          while True:
+              resp = api("deals", status="won", start=start, limit=500)
+              data = resp.get("data") or []
+              for d in data:
+                  if d.get("pipeline_id") != PIPELINE_ID:
+                      continue
+                  ganhos += 1
+                  wd = _pdate(d.get("won_time") or d.get("close_time"))
+                  if wd and wd.year == ano:
+                      v = float(d.get("value") or 0)
+                      if eh_servico(d.get("title")):
+                          vendido_serv += v
+                      else:
+                          vendido_neg += v
+              pag = (resp.get("additional_data") or {}).get("pagination") or {}
+              if pag.get("more_items_in_collection"):
+                  start = pag.get("next_start", start + 500)
+              else:
+                  break
+
+          def conta_status(status):
+              n = 0
+              start = 0
+              while True:
+                  resp = api("deals", status=status, start=start, limit=500)
+                  data = resp.get("data") or []
+                  for d in data:
+                      if d.get("pipeline_id") == PIPELINE_ID:
+                          n += 1
+                  pag = (resp.get("additional_data") or {}).get("pagination") or {}
+                  if pag.get("more_items_in_collection"):
+                      start = pag.get("next_start", start + 500)
+                  else:
+                      break
+              return n
+          perdidos = conta_status("lost")
+          conv = (ganhos / (ganhos + perdidos) * 100) if (ganhos + perdidos) else 0
+          prog_neg = (vendido_neg / META_NEG * 100) if META_NEG else 0
+          prog_serv = (vendido_serv / META_SERV * 100) if META_SERV else 0
+          falta_neg = max(META_NEG - vendido_neg, 0)
+          falta_serv = max(META_SERV - vendido_serv, 0)
+
+          # Ritmo: compara o progresso com o esperado para a altura do ano
+          _inicio = datetime.date(ano, 1, 1)
+          _dias_ano = (datetime.date(ano + 1, 1, 1) - _inicio).days
+          esperado_pct = ((hoje - _inicio).days + 1) / _dias_ano * 100
+          def _status(prog_pct):
+              ratio = (prog_pct / esperado_pct) if esperado_pct > 0 else 1
+              if ratio >= 0.9:
+                  return "ok", "no ritmo"
+              if ratio >= 0.7:
+                  return "warn", "um pouco atrás"
+              return "bad", "atrasado"
+          st_neg, rot_neg = _status(prog_neg)
+          st_serv, rot_serv = _status(prog_serv)
+
           def brl(v):
               s = f"{v:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
               return "R$ " + s
@@ -109,8 +199,9 @@ jobs:
               pct = a["value"] / maxv * 100
               rows_html += f'''    <div class="bar-row">
               <div class="name">{name}</div>
-              <div class="track"><div class="fill" style="width:{max(pct,7):.1f}%">{brl(a["value"])}</div></div>
-              <div class="cnt"><b>{a["count"]}</b><small>negocios</small></div>
+              <div class="track"><div class="fill" style="width:{max(pct,2):.1f}%"></div></div>
+              <div class="valcol">{brl(a["value"])}</div>
+              <div class="cnt"><b>{a["count"]}</b><small>negócios</small></div>
             </div>
           '''
 
@@ -125,7 +216,7 @@ jobs:
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <meta http-equiv="refresh" content="1800">
-          <title>Funil Comercial - Contrologica</title>
+          <title>Funil Comercial Contrológica</title>
           <style>
             :root{{--bg:#0b1220;--panel:#111c30;--panel2:#16233c;--line:#22314f;--txt:#eaf1ff;--muted:#93a4c4;--accent:#3b82f6;--accent2:#22d3ee;--green:#34d399;--amber:#fbbf24;}}
             *{{box-sizing:border-box;margin:0;padding:0}}
@@ -134,35 +225,79 @@ jobs:
             h1{{font-size:2.1rem;font-weight:700}} h1 span{{color:var(--accent2)}}
             .sub{{color:var(--muted);font-size:.95rem;margin-top:.35rem}}
             .stamp{{text-align:right;color:var(--muted);font-size:.9rem;line-height:1.5}} .stamp b{{color:var(--txt);font-size:1.05rem}}
-            .kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.1rem;margin-bottom:1.8rem}}
-            .kpi{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.3rem 1.4rem;position:relative;overflow:hidden}}
+            .metas{{display:grid;grid-template-columns:1fr;gap:1.1rem;margin-bottom:1.8rem}}
+            .meta{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.3rem 1.6rem}}
+            .meta-head{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.8rem;flex-wrap:wrap;gap:.5rem}}
+            .meta-title{{font-size:1.2rem;font-weight:700}}
+            .meta-nums{{color:var(--muted);font-size:1rem}} .meta-nums b{{color:var(--txt);font-size:1.3rem}}
+            .meta-track{{background:var(--panel2);border-radius:12px;height:40px;overflow:hidden}}
+            .meta-fill{{height:100%;border-radius:12px;background:linear-gradient(90deg,var(--green),var(--accent2));display:flex;align-items:center;justify-content:flex-end;padding-right:1rem;color:#012;font-weight:800;font-size:1.05rem;min-width:46px}}
+            .meta-fill.serv{{background:linear-gradient(90deg,var(--amber),#f59e0b)}}
+            .meta-fill.ok{{background:linear-gradient(90deg,#16a34a,#34d399)}}
+            .meta-fill.warn{{background:linear-gradient(90deg,#d97706,#fbbf24)}}
+            .meta-fill.bad{{background:linear-gradient(90deg,#b91c1c,#f87171)}}
+            .badge{{font-size:.8rem;font-weight:700;padding:.15rem .6rem;border-radius:999px;margin-left:.5rem;vertical-align:middle}}
+            .badge.ok{{background:rgba(52,211,153,.16);color:#34d399}}
+            .badge.warn{{background:rgba(251,191,36,.16);color:#fbbf24}}
+            .badge.bad{{background:rgba(248,113,113,.16);color:#f87171}}
+            .kpis{{display:grid;grid-template-columns:repeat(5,1fr);gap:1rem;margin-bottom:1.8rem}}
+            .kpi{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.2rem 1.3rem;position:relative;overflow:hidden}}
             .kpi::after{{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--accent)}}
-            .kpi.k2::after{{background:var(--accent2)}} .kpi.k3::after{{background:var(--green)}} .kpi.k4::after{{background:var(--amber)}}
-            .kpi .lab{{color:var(--muted);font-size:.85rem;text-transform:uppercase;letter-spacing:.6px}}
-            .kpi .val{{font-size:2.05rem;font-weight:700;margin-top:.4rem}} .kpi .val small{{font-size:1rem;color:var(--muted);font-weight:500}}
+            .kpi.k2::after{{background:var(--accent2)}} .kpi.k3::after{{background:var(--green)}} .kpi.k4::after{{background:var(--amber)}} .kpi.k5::after{{background:#a78bfa}}
+            .kpi .lab{{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.5px}}
+            .kpi .val{{font-size:1.7rem;font-weight:700;margin-top:.4rem}} .kpi .val small{{font-size:.9rem;color:var(--muted);font-weight:500}}
             .card{{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:1.6rem 1.8rem}}
             .card h2{{font-size:1.2rem;margin-bottom:1.4rem;font-weight:600}}
-            .bar-row{{display:grid;grid-template-columns:190px 1fr 130px;align-items:center;gap:1rem;margin-bottom:1.15rem}}
+            .bar-row{{display:grid;grid-template-columns:180px 1fr 160px 90px;align-items:center;gap:1rem;margin-bottom:1.15rem}}
             .bar-row .name{{font-weight:600;font-size:1rem}}
             .track{{background:var(--panel2);border-radius:10px;height:34px;position:relative;overflow:hidden}}
-            .fill{{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:flex-end;padding-right:.7rem;color:#001;font-weight:700;font-size:.9rem;min-width:60px}}
+            .fill{{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));min-width:6px}}
+            .valcol{{text-align:right;font-weight:700;font-size:1.02rem;color:var(--txt);white-space:nowrap}}
             .cnt{{text-align:right}} .cnt b{{font-size:1.5rem}} .cnt small{{color:var(--muted);display:block;font-size:.78rem}}
+            .alerts{{display:grid;grid-template-columns:repeat(3,1fr);gap:1.1rem;margin-bottom:1.8rem}}
+            .alert{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.15rem 1.4rem;display:flex;align-items:center;gap:1rem}}
+            .alert .anum{{font-size:2.1rem;font-weight:700;line-height:1;color:var(--txt)}}
+            .alert .alab{{color:var(--muted);font-size:.92rem;line-height:1.25}}
+            .alert.warn{{border-color:#7a4a12}} .alert.warn .anum{{color:var(--amber)}}
+            .alert.bad{{border-color:#7a2a2a}} .alert.bad .anum{{color:#f87171}}
             footer{{margin-top:1.6rem;color:var(--muted);font-size:.82rem;text-align:center}}
           </style>
           </head>
           <body>
             <header>
               <div>
-                <h1>Funil Comercial <span>Contrologica</span></h1>
-                <div class="sub">Negocios em aberto - atualizacao automatica de hora em hora</div>
+                <h1>Funil Comercial <span>Contrológica</span></h1>
+                <div class="sub">Negócios em aberto · atualização automática de hora em hora</div>
               </div>
               <div class="stamp">Atualizado em<br><b>{stamp}</b></div>
             </header>
+            <section class="metas">
+              <div class="meta">
+                <div class="meta-head">
+                  <div class="meta-title">Meta Negócios {ano} <span class="badge {st_neg}">{rot_neg}</span></div>
+                  <div class="meta-nums"><b>{brl(vendido_neg)}</b> de {brl(META_NEG)} &nbsp;-&nbsp; faltam {brl(falta_neg)}</div>
+                </div>
+                <div class="meta-track"><div class="meta-fill {st_neg}" style="width:{min(prog_neg,100):.1f}%">{prog_neg:.0f}%</div></div>
+              </div>
+              <div class="meta">
+                <div class="meta-head">
+                  <div class="meta-title">Meta Serviços {ano} <span class="badge {st_serv}">{rot_serv}</span></div>
+                  <div class="meta-nums"><b>{brl(vendido_serv)}</b> de {brl(META_SERV)} &nbsp;-&nbsp; faltam {brl(falta_serv)}</div>
+                </div>
+                <div class="meta-track"><div class="meta-fill {st_serv}" style="width:{min(prog_serv,100):.1f}%">{prog_serv:.0f}%</div></div>
+              </div>
+            </section>
             <section class="kpis">
               <div class="kpi k1"><div class="lab">Valor total em aberto</div><div class="val">{brl(total_value)}</div></div>
-              <div class="kpi k2"><div class="lab">Negocios abertos</div><div class="val">{total_count}</div></div>
-              <div class="kpi k3"><div class="lab">Ticket medio</div><div class="val">{brl(avg_ticket)}</div></div>
-              <div class="kpi k4"><div class="lab">Maior negocio</div><div class="val">{big_val} <small>{big_name}</small></div></div>
+              <div class="kpi k2"><div class="lab">Negócios abertos</div><div class="val">{total_count}</div></div>
+              <div class="kpi k3"><div class="lab">Ticket médio</div><div class="val">{brl(avg_ticket)}</div></div>
+              <div class="kpi k4"><div class="lab">Maior negócio</div><div class="val">{big_val} <small>{big_name}</small></div></div>
+              <div class="kpi k5"><div class="lab">Taxa de conversão</div><div class="val">{conv:.0f}% <small>{ganhos} ganhos / {perdidos} perdidos</small></div></div>
+            </section>
+            <section class="alerts">
+              <div class="alert"><div class="anum">{sem_valor}</div><div class="alab">Negócios sem valor<br>(R$ 0)</div></div>
+              <div class="alert warn"><div class="anum">{followup_vencido}</div><div class="alab">Follow-up vencido<br>(próxima atividade atrasada)</div></div>
+              <div class="alert bad"><div class="anum">{sem_atividade}</div><div class="alab">Sem próxima atividade<br>(nenhum follow-up agendado)</div></div>
             </section>
             <div class="card">
               <h2>Valor por etapa do funil</h2>
