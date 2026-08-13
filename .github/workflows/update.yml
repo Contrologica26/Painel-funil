@@ -165,6 +165,17 @@ jobs:
                   pd = _pdate(nad)
                   if pd and pd < hoje:
                       followup_vencido += 1
+          # Oportunidades SEM valor: propostas abertas, valor 0, na etapa "Oportunidades"
+          def _eh_oportunidade(d):
+              nome = stages.get(d.get("stage_id"), {}).get("name", "")
+              return "oportunidad" in nome.lower()
+          opp_sv = [d for d in deals if float(d.get("value") or 0) == 0 and _eh_oportunidade(d)]
+          opp_sv_total = len(opp_sv)
+          opp_sv_paradas = 0
+          for d in opp_sv:
+              ut = _pdate(d.get("update_time"))
+              if ut and (hoje - ut).days > 7:
+                  opp_sv_paradas += 1
           # Ganhos no pipeline: contagem (p/ conversao) + soma do ano por categoria (p/ metas)
           META_NEG = float(os.environ.get("META_NEGOCIOS", "3000000"))
           META_SERV = float(os.environ.get("META_SERVICOS", "500000"))
@@ -284,7 +295,7 @@ jobs:
             .fill{{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));min-width:6px}}
             .valcol{{text-align:right;font-weight:700;font-size:1.02rem;color:var(--txt);white-space:nowrap}}
             .cnt{{text-align:right}} .cnt b{{font-size:1.5rem}} .cnt small{{color:var(--muted);display:block;font-size:.78rem}}
-            .alerts{{display:grid;grid-template-columns:repeat(3,1fr);gap:1.1rem;margin-bottom:1.8rem}}
+            .alerts{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.8rem}}
             .alert{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.15rem 1.4rem;display:flex;align-items:center;gap:1rem}}
             .alert .anum{{font-size:2.1rem;font-weight:700;line-height:1;color:var(--txt)}}
             .alert .alab{{color:var(--muted);font-size:.92rem;line-height:1.25}}
@@ -340,6 +351,7 @@ jobs:
               <div class="alert"><div class="anum">{sem_valor}</div><div class="alab">Negócios sem valor<br>(R$ 0)</div></div>
               <div class="alert warn"><div class="anum">{followup_vencido}</div><div class="alab">Follow-up vencido<br>(próxima atividade atrasada)</div></div>
               <div class="alert bad"><div class="anum">{sem_atividade}</div><div class="alab">Sem próxima atividade<br>(nenhum follow-up agendado)</div></div>
+              <div class="alert bad"><div class="anum">{opp_sv_paradas}</div><div class="alab">Oportunidades sem valor<br>paradas +7 dias (de {opp_sv_total})</div></div>
             </section>
             <section class="grid2">
               <div class="card">
