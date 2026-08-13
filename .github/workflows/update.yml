@@ -25,6 +25,7 @@ jobs:
           PIPEDRIVE_TOKEN: ${{ secrets.PIPEDRIVE_TOKEN }}
           PIPEDRIVE_DOMAIN: 'contrologica'
           PIPELINE_ID: '27'
+          PIPELINE_IDS: '27,42'
           META_NEGOCIOS: '3000000'
           META_SERVICOS: '500000'
         run: |
@@ -34,6 +35,7 @@ jobs:
 
           TOKEN = os.environ["PIPEDRIVE_TOKEN"]
           PIPELINE_ID = int(os.environ.get("PIPELINE_ID", "27"))
+          PIPELINE_IDS = [int(x) for x in os.environ.get("PIPELINE_IDS", "27,42").split(",") if x.strip()]
           DOMAIN = os.environ.get("PIPEDRIVE_DOMAIN", "").strip()
 
           # Tenta o dominio da empresa primeiro; se falhar, usa o endereco generico.
@@ -61,12 +63,13 @@ jobs:
 
           # 1) Nomes reais das etapas do pipeline
           stages = {}
-          try:
-              sd = api("stages", pipeline_id=PIPELINE_ID).get("data") or []
-              for s in sd:
-                  stages[s["id"]] = {"name": s["name"], "order": s.get("order_nr", 0)}
-          except Exception as e:
-              print("Aviso: nao consegui ler stages:", e)
+          for pid in PIPELINE_IDS:
+              try:
+                  sd = api("stages", pipeline_id=pid).get("data") or []
+                  for s in sd:
+                      stages[s["id"]] = {"name": s["name"], "order": s.get("order_nr", 0)}
+              except Exception as e:
+                  print(f"Aviso: nao consegui ler stages do funil {pid}:", e)
 
           # 2) Todos os negocios em aberto (com paginacao)
           deals = []
@@ -75,7 +78,7 @@ jobs:
               resp = api("deals", status="open", start=start, limit=100)
               data = resp.get("data") or []
               for d in data:
-                  if d.get("pipeline_id") == PIPELINE_ID:
+                  if d.get("pipeline_id") in PIPELINE_IDS:
                       deals.append(d)
               pag = (resp.get("additional_data") or {}).get("pagination") or {}
               if pag.get("more_items_in_collection"):
@@ -83,15 +86,21 @@ jobs:
               else:
                   break
 
-          # 3) Agrega por etapa
+          # 3) Agrega por etapa (por NOME da etapa, somando os funis)
           agg = defaultdict(lambda: {"count": 0, "value": 0.0})
+          name_order = {}
           for d in deals:
               sid = d.get("stage_id")
-              agg[sid]["count"] += 1
-              agg[sid]["value"] += float(d.get("value") or 0)
+              info = stages.get(sid, {})
+              nome = info.get("name", f"Etapa {sid}")
+              agg[nome]["count"] += 1
+              agg[nome]["value"] += float(d.get("value") or 0)
+              o = info.get("order", 999)
+              if nome not in name_order or o < name_order[nome]:
+                  name_order[nome] = o
 
-          def stage_key(sid):
-              return stages.get(sid, {}).get("order", 999), sid
+          def stage_key(nome):
+              return name_order.get(nome, 999), nome
           ordered = sorted(agg.keys(), key=stage_key)
 
           # 3b) Agrega por vendedor (dono do negocio)
@@ -171,7 +180,7 @@ jobs:
               resp = api("deals", status="won", start=start, limit=500)
               data = resp.get("data") or []
               for d in data:
-                  if d.get("pipeline_id") != PIPELINE_ID:
+                  if d.get("pipeline_id") not in PIPELINE_IDS:
                       continue
                   ganhos += 1
                   wd = _pdate(d.get("won_time") or d.get("close_time"))
@@ -194,7 +203,7 @@ jobs:
                   resp = api("deals", status=status, start=start, limit=500)
                   data = resp.get("data") or []
                   for d in data:
-                      if d.get("pipeline_id") == PIPELINE_ID:
+                      if d.get("pipeline_id") in PIPELINE_IDS:
                           n += 1
                   pag = (resp.get("additional_data") or {}).get("pagination") or {}
                   if pag.get("more_items_in_collection"):
@@ -229,9 +238,9 @@ jobs:
 
           maxv = max((agg[s]["value"] for s in ordered), default=1) or 1
           rows_html = ""
-          for sid in ordered:
-              a = agg[sid]
-              name = stages.get(sid, {}).get("name", f"Etapa {sid}")
+          for nome in ordered:
+              a = agg[nome]
+              name = nome
               pct = a["value"] / maxv * 100
               rows_html += f'''    <div class="bar-row">
               <div class="name">{name}</div>
@@ -265,7 +274,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <meta http-equiv="refresh" content="1800">
+          <meta http-equiv="refresh" content="600">
           <title>Funil Comercial Contrológica</title>
           <style>
             :root{{--bg:#0b1220;--panel:#111c30;--panel2:#16233c;--line:#22314f;--txt:#eaf1ff;--muted:#93a4c4;--accent:#3b82f6;--accent2:#22d3ee;--green:#34d399;--amber:#fbbf24;}}
@@ -329,7 +338,7 @@ jobs:
             <header>
               <div>
                 <h1>Funil Comercial <span>Contrológica</span></h1>
-                <div class="sub">Negócios em aberto · atualização automática de hora em hora</div>
+                <div class="sub">Negócios em aberto · funis 27 + 42 · atualização automática</div>
               </div>
               <div class="stamp">Atualizado em<br><b>{stamp}</b></div>
             </header>
