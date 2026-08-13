@@ -94,6 +94,42 @@ jobs:
               return stages.get(sid, {}).get("order", 999), sid
           ordered = sorted(agg.keys(), key=stage_key)
 
+          # 3b) Agrega por vendedor (dono do negocio)
+          def owner_name(d):
+              u = d.get("user_id")
+              if isinstance(u, dict):
+                  return u.get("name") or "Sem dono"
+              return "Sem dono"
+          own = defaultdict(float)
+          for d in deals:
+              own[owner_name(d)] += float(d.get("value") or 0)
+
+          # 3c) Saude das propostas (regra 80/20 por CONTAGEM de propostas com valor)
+          THRESH_80 = 500000
+          TARGET_ABOVE = 20.0
+          TOL_80 = 5.0
+          com_valor = [d for d in deals if float(d.get("value") or 0) > 0]
+          pnz = len(com_valor)
+          below_n = sum(1 for d in com_valor if float(d.get("value") or 0) < THRESH_80)
+          above_n = pnz - below_n
+          pb80 = round(100 * below_n / pnz, 1) if pnz else 0
+          pa80 = round(100 * above_n / pnz, 1) if pnz else 0
+          dev80 = abs(pa80 - TARGET_ABOVE)
+          if dev80 <= TOL_80:
+              h80_cls, h80_tit = "ok", "No alvo 80/20"
+          elif dev80 <= 2 * TOL_80:
+              h80_cls, h80_tit = "warn", "Levemente fora do alvo"
+          else:
+              h80_cls, h80_tit = "bad", "Fora do alvo 80/20"
+          if pnz == 0:
+              h80_sub = "sem propostas com valor"
+          elif pa80 < TARGET_ABOVE - TOL_80:
+              h80_sub = "poucas propostas de grande porte (meta 20% acima de R$ 500k)"
+          elif pa80 > TARGET_ABOVE + TOL_80:
+              h80_sub = "excesso de propostas de grande porte (limite 20%)"
+          else:
+              h80_sub = "mix dentro do alvo 80% / 20%"
+
           total_value = sum(a["value"] for a in agg.values())
           total_count = sum(a["count"] for a in agg.values())
           avg_ticket = total_value / total_count if total_count else 0
@@ -205,6 +241,20 @@ jobs:
             </div>
           '''
 
+          # Barras por vendedor (valor em aberto)
+          maxo = max(own.values(), default=1) or 1
+          own_html = ""
+          for nome, val in sorted(own.items(), key=lambda x: -x[1]):
+              if val <= 0:
+                  continue
+              pct = val / maxo * 100
+              own_html += f'''    <div class="bar-row vend">
+              <div class="name">{nome}</div>
+              <div class="track"><div class="fill" style="width:{max(pct,2):.1f}%"></div></div>
+              <div class="valcol">{brl(val)}</div>
+            </div>
+          '''
+
           now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
           stamp = now.strftime("%d/%m/%Y %H:%M")
           big_val = brl(float(biggest.get("value") or 0)) if biggest else "-"
@@ -260,6 +310,18 @@ jobs:
             .alert .alab{{color:var(--muted);font-size:.92rem;line-height:1.25}}
             .alert.warn{{border-color:#7a4a12}} .alert.warn .anum{{color:var(--amber)}}
             .alert.bad{{border-color:#7a2a2a}} .alert.bad .anum{{color:#f87171}}
+            .grid2{{display:grid;grid-template-columns:1.3fr 1fr;gap:1.4rem;margin-top:1.8rem;align-items:start}}
+            .col{{display:flex;flex-direction:column;gap:1.4rem}}
+            .bar-row.vend{{grid-template-columns:200px 1fr 160px}}
+            .split{{position:relative;display:flex;height:36px;border-radius:10px;overflow:hidden;background:var(--panel2);margin:.5rem 0 1.1rem}}
+            .sp{{height:100%}} .sp.below{{background:linear-gradient(90deg,#16a34a,#34d399)}} .sp.above{{background:linear-gradient(90deg,#d97706,#fbbf24)}}
+            .mark{{position:absolute;top:-5px;bottom:-5px;width:3px;background:#fff;opacity:.9}}
+            .split-leg{{display:flex;gap:1.4rem;align-items:center;color:var(--muted);font-size:1rem;flex-wrap:wrap}}
+            .split-leg i{{display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:.4rem;vertical-align:-1px}}
+            .split-leg .dg{{background:#34d399}} .split-leg .do{{background:#fbbf24}}
+            .split-leg .target{{margin-left:auto;text-transform:uppercase;letter-spacing:.5px;font-size:.85rem}}
+            .split-stat{{margin-top:1rem;font-size:1.08rem;font-weight:600}}
+            .split-stat.ok{{color:#34d399}} .split-stat.warn{{color:#fbbf24}} .split-stat.bad{{color:#f87171}}
             footer{{margin-top:1.6rem;color:var(--muted);font-size:.82rem;text-align:center}}
           </style>
           </head>
@@ -299,10 +361,28 @@ jobs:
               <div class="alert warn"><div class="anum">{followup_vencido}</div><div class="alab">Follow-up vencido<br>(próxima atividade atrasada)</div></div>
               <div class="alert bad"><div class="anum">{sem_atividade}</div><div class="alab">Sem próxima atividade<br>(nenhum follow-up agendado)</div></div>
             </section>
-            <div class="card">
-              <h2>Valor por etapa do funil</h2>
+            <section class="grid2">
+              <div class="card">
+                <h2>Valor por etapa do funil</h2>
           {rows_html}
-            </div>
+              </div>
+              <div class="col">
+                <div class="card">
+                  <h2>Por vendedor · valor em aberto</h2>
+          {own_html}
+                </div>
+                <div class="card">
+                  <h2>Saúde das propostas · regra 80/20</h2>
+                  <div class="split"><div class="sp below" style="width:{pb80}%"></div><div class="sp above" style="width:{pa80}%"></div><div class="mark" style="left:80%"></div></div>
+                  <div class="split-leg">
+                    <span><i class="dg"></i>{below_n} abaixo de R$ 500k · {pb80}%</span>
+                    <span><i class="do"></i>{above_n} acima · {pa80}%</span>
+                    <span class="target">meta 80 / 20</span>
+                  </div>
+                  <div class="split-stat {h80_cls}">{h80_tit} — {h80_sub}</div>
+                </div>
+              </div>
+            </section>
             <footer>Dados do Pipedrive - painel gerado automaticamente pelo GitHub Actions.</footer>
           </body>
           </html>'''
