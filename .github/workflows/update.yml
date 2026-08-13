@@ -1,49 +1,43 @@
 name: Atualiza painel do funil
-
 on:
   schedule:
     - cron: '11,41 * * * *'      # de hora em hora (horario UTC)
   workflow_dispatch:          # permite rodar na mao pelo botao "Run workflow"
-
 permissions:
   contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Baixa o repositorio
         uses: actions/checkout@v4
-
       - name: Prepara Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Gera o painel (puxa Pipedrive)
         env:
           PIPEDRIVE_TOKEN: ${{ secrets.PIPEDRIVE_TOKEN }}
           PIPEDRIVE_DOMAIN: 'contrologica'
           PIPELINE_ID: '27'
           PIPELINE_IDS: '27,42'
+          FUNIL_SERVICOS_IDS: ''
           META_NEGOCIOS: '3000000'
           META_SERVICOS: '500000'
         run: |
           python - <<'PY'
           import os, json, re, urllib.request, urllib.parse, datetime
           from collections import defaultdict
-
           TOKEN = os.environ["PIPEDRIVE_TOKEN"]
           PIPELINE_ID = int(os.environ.get("PIPELINE_ID", "27"))
           PIPELINE_IDS = [int(x) for x in os.environ.get("PIPELINE_IDS", "27,42").split(",") if x.strip()]
           DOMAIN = os.environ.get("PIPEDRIVE_DOMAIN", "").strip()
-
           # Tenta o dominio da empresa primeiro; se falhar, usa o endereco generico.
           BASES = []
           if DOMAIN:
               BASES.append(f"https://{DOMAIN}.pipedrive.com/api/v1")
           BASES.append("https://api.pipedrive.com/v1")
-
           _base = {"url": None}
           def api(path, **params):
               params["api_token"] = TOKEN
@@ -60,7 +54,22 @@ jobs:
                   except Exception as e:
                       last = e
               raise RuntimeError(f"Falha na API Pipedrive ({path}): {last}")
-
+          def iter_deals(status):
+              # Paginacao segura: so avanca se next_start for inteiro valido; teto de 400 paginas
+              start = 0
+              paginas = 0
+              while True:
+                  resp = api("deals", status=status, start=start, limit=500)
+                  data = resp.get("data") or []
+                  for d in data:
+                      yield d
+                  pag = (resp.get("additional_data") or {}).get("pagination") or {}
+                  nxt = pag.get("next_start")
+                  paginas += 1
+                  if pag.get("more_items_in_collection") and isinstance(nxt, int) and nxt > start and paginas < 400:
+                      start = nxt
+                  else:
+                      break
           # 1) Nomes reais das etapas do pipeline
           stages = {}
           for pid in PIPELINE_IDS:
@@ -70,22 +79,21 @@ jobs:
                       stages[s["id"]] = {"name": s["name"], "order": s.get("order_nr", 0)}
               except Exception as e:
                   print(f"Aviso: nao consegui ler stages do funil {pid}:", e)
-
+          # 1b) Descobre quais funis sao de SERVICOS (pelo nome; ou via env FUNIL_SERVICOS_IDS)
+          serv_pipes = set()
+          _ov = os.environ.get("FUNIL_SERVICOS_IDS", "").strip()
+          if _ov:
+              serv_pipes = {int(x) for x in _ov.split(",") if x.strip()}
+          else:
+              try:
+                  for p in (api("pipelines").get("data") or []):
+                      if p.get("id") in PIPELINE_IDS and "serv" in (p.get("name") or "").lower():
+                          serv_pipes.add(p["id"])
+              except Exception as e:
+                  print("Aviso: nao consegui ler pipelines:", e)
+          print("Funis de Servicos:", serv_pipes, "| Funis de Negocios:", [p for p in PIPELINE_IDS if p not in serv_pipes])
           # 2) Todos os negocios em aberto (com paginacao)
-          deals = []
-          start = 0
-          while True:
-              resp = api("deals", status="open", start=start, limit=100)
-              data = resp.get("data") or []
-              for d in data:
-                  if d.get("pipeline_id") in PIPELINE_IDS:
-                      deals.append(d)
-              pag = (resp.get("additional_data") or {}).get("pagination") or {}
-              if pag.get("more_items_in_collection"):
-                  start = pag.get("next_start", start + 100)
-              else:
-                  break
-
+          deals = [d for d in iter_deals("open") if d.get("pipeline_id") in PIPELINE_IDS]
           # 3) Agrega por etapa (por NOME da etapa, somando os funis)
           agg = defaultdict(lambda: {"count": 0, "value": 0.0})
           name_order = {}
@@ -98,11 +106,9 @@ jobs:
               o = info.get("order", 999)
               if nome not in name_order or o < name_order[nome]:
                   name_order[nome] = o
-
           def stage_key(nome):
               return name_order.get(nome, 999), nome
           ordered = sorted(agg.keys(), key=stage_key)
-
           # 3b) Agrega por vendedor (dono do negocio)
           def owner_name(d):
               u = d.get("user_id")
@@ -112,7 +118,6 @@ jobs:
           own = defaultdict(float)
           for d in deals:
               own[owner_name(d)] += float(d.get("value") or 0)
-
           # 3c) Saude das propostas (regra 80/20 por CONTAGEM de propostas com valor)
           THRESH_80 = 500000
           TARGET_ABOVE = 20.0
@@ -138,12 +143,10 @@ jobs:
               h80_sub = "excesso de propostas de grande porte (limite 20%)"
           else:
               h80_sub = "mix dentro do alvo 80% / 20%"
-
           total_value = sum(a["value"] for a in agg.values())
           total_count = sum(a["count"] for a in agg.values())
           avg_ticket = total_value / total_count if total_count else 0
           biggest = max(deals, key=lambda d: float(d.get("value") or 0)) if deals else None
-
           # Indicadores de atencao
           hoje = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).date()
           def _pdate(s):
@@ -162,62 +165,35 @@ jobs:
                   pd = _pdate(nad)
                   if pd and pd < hoje:
                       followup_vencido += 1
-
           # Ganhos no pipeline: contagem (p/ conversao) + soma do ano por categoria (p/ metas)
           META_NEG = float(os.environ.get("META_NEGOCIOS", "3000000"))
           META_SERV = float(os.environ.get("META_SERVICOS", "500000"))
           ano = hoje.year
-
-          def eh_servico(title):
-              t = (title or "").lower()
-              return ("serv" in t) or ("contrato" in t) or ("calibra" in t) or ("manuten" in t)
-
           ganhos = 0
           vendido_neg = 0.0
           vendido_serv = 0.0
-          start = 0
-          while True:
-              resp = api("deals", status="won", start=start, limit=500)
-              data = resp.get("data") or []
-              for d in data:
-                  if d.get("pipeline_id") not in PIPELINE_IDS:
-                      continue
-                  ganhos += 1
-                  wd = _pdate(d.get("won_time") or d.get("close_time"))
-                  if wd and wd.year == ano:
-                      v = float(d.get("value") or 0)
-                      if eh_servico(d.get("title")):
-                          vendido_serv += v
-                      else:
-                          vendido_neg += v
-              pag = (resp.get("additional_data") or {}).get("pagination") or {}
-              if pag.get("more_items_in_collection"):
-                  start = pag.get("next_start", start + 500)
-              else:
-                  break
-
-          def conta_status(status):
-              n = 0
-              start = 0
-              while True:
-                  resp = api("deals", status=status, start=start, limit=500)
-                  data = resp.get("data") or []
-                  for d in data:
-                      if d.get("pipeline_id") in PIPELINE_IDS:
-                          n += 1
-                  pag = (resp.get("additional_data") or {}).get("pagination") or {}
-                  if pag.get("more_items_in_collection"):
-                      start = pag.get("next_start", start + 500)
+          linhas_ganhos = []
+          for d in iter_deals("won"):
+              if d.get("pipeline_id") not in PIPELINE_IDS:
+                  continue
+              ganhos += 1
+              wd = _pdate(d.get("won_time") or d.get("close_time"))
+              if wd and wd.year == ano:
+                  v = float(d.get("value") or 0)
+                  cat = "Servicos" if d.get("pipeline_id") in serv_pipes else "Negocios"
+                  if cat == "Servicos":
+                      vendido_serv += v
                   else:
-                      break
-              return n
+                      vendido_neg += v
+                  linhas_ganhos.append((cat, d.get("title") or "", v, str(wd), d.get("pipeline_id")))
+          def conta_status(status):
+              return sum(1 for d in iter_deals(status) if d.get("pipeline_id") in PIPELINE_IDS)
           perdidos = conta_status("lost")
           conv = (ganhos / (ganhos + perdidos) * 100) if (ganhos + perdidos) else 0
           prog_neg = (vendido_neg / META_NEG * 100) if META_NEG else 0
           prog_serv = (vendido_serv / META_SERV * 100) if META_SERV else 0
           falta_neg = max(META_NEG - vendido_neg, 0)
           falta_serv = max(META_SERV - vendido_serv, 0)
-
           # Ritmo: compara o progresso com o esperado para a altura do ano
           _inicio = datetime.date(ano, 1, 1)
           _dias_ano = (datetime.date(ano + 1, 1, 1) - _inicio).days
@@ -231,11 +207,9 @@ jobs:
               return "bad", "atrasado"
           st_neg, rot_neg = _status(prog_neg)
           st_serv, rot_serv = _status(prog_serv)
-
           def brl(v):
               s = f"{v:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
               return "R$ " + s
-
           maxv = max((agg[s]["value"] for s in ordered), default=1) or 1
           rows_html = ""
           for nome in ordered:
@@ -249,7 +223,6 @@ jobs:
               <div class="cnt"><b>{a["count"]}</b><small>negócios</small></div>
             </div>
           '''
-
           # Barras por vendedor (valor em aberto)
           maxo = max(own.values(), default=1) or 1
           own_html = ""
@@ -263,12 +236,10 @@ jobs:
               <div class="valcol">{brl(val)}</div>
             </div>
           '''
-
           now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
           stamp = now.strftime("%d/%m/%Y %H:%M")
           big_val = brl(float(biggest.get("value") or 0)) if biggest else "-"
           big_name = (biggest.get("title") or "")[:34] if biggest else ""
-
           html = f'''<!DOCTYPE html>
           <html lang="pt-BR">
           <head>
@@ -395,16 +366,25 @@ jobs:
             <footer>Dados do Pipedrive - painel gerado automaticamente pelo GitHub Actions.</footer>
           </body>
           </html>'''
-
           with open("index.html", "w", encoding="utf-8") as f:
               f.write(html)
-          print(f"OK: {total_count} negocios, {len(ordered)} etapas, total {brl(total_value)}")
-          PY
 
+          # Lista detalhada dos pedidos ganhos de 2026 (para reconciliacao)
+          linhas_ganhos.sort(key=lambda x: (x[0], x[1]))
+          with open("ganhos_2026.csv", "w", encoding="utf-8") as f:
+              f.write("categoria;titulo;valor;data_ganho;funil\n")
+              for cat, titulo, v, dts, pid in linhas_ganhos:
+                  tt = titulo.replace(";", ",")
+                  vv = f"{v:.2f}".replace(".", ",")
+                  f.write(f"{cat};{tt};{vv};{dts};{pid}\n")
+
+          print(f"OK: {total_count} negocios, {len(ordered)} etapas, total {brl(total_value)}")
+          print(f"Ganhos {ano}: {len(linhas_ganhos)} pedidos | Negocios {brl(vendido_neg)} | Servicos {brl(vendido_serv)}")
+          PY
       - name: Publica se houver mudanca
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html
+          git add index.html ganhos_2026.csv
           git diff --quiet --cached || git commit -m "Atualiza painel do funil"
           git push
